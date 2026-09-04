@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Editorial assets stay local and are not part of the code repository.
+assets/
+构建你的第一个Ray应用-PANNs.md

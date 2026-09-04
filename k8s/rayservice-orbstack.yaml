@@ -1,0 +1,69 @@
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: ray-panns
+  namespace: default
+spec:
+  serviceUnhealthySecondThreshold: 900
+  deploymentUnhealthySecondThreshold: 900
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: ray-panns-head:k8s-v1
+              imagePullPolicy: Never
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "2Gi"
+                limits:
+                  cpu: "2"
+                  memory: "4Gi"
+    workerGroupSpecs:
+      - groupName: panns-workers
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 2
+        rayStartParams:
+          num-cpus: "2"
+          resources: "'{\"panns_worker\":1}'"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: ray-panns-worker:k8s-v3
+                imagePullPolicy: Never
+                env:
+                  - name: PANNS_DEVICE
+                    value: cpu
+                  - name: PANNS_MOCK
+                    value: "1"
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: "2Gi"
+                  limits:
+                    cpu: "2"
+                    memory: "4Gi"
+  serveConfigV2: |
+    proxy_location: EveryNode
+    http_options:
+      host: 0.0.0.0
+      port: 8000
+    applications:
+      - name: panns
+        route_prefix: /
+        import_path: main:app
+        deployments:
+          - name: PannsService
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 1
+              resources:
+                panns_worker: 0.001

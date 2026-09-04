@@ -1,0 +1,9 @@
+applications:
+  - name: panns
+    route_prefix: /
+    import_path: main:app
+    runtime_env:
+      working_dir: .
+    deployments:
+      - name: PannsService
+        num_replicas: 1

@@ -1,0 +1,8 @@
+FROM rayproject/ray:2.58.0-py311
+
+# The head needs the Serve application graph so RayService can import main:app.
+# Heavy PANNs runtime dependencies remain in the Worker image.
+WORKDIR /app
+ENV PYTHONPATH=/app
+COPY ray_panns ./ray_panns
+COPY main.py ./

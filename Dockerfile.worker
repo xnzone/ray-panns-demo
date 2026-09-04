@@ -1,0 +1,14 @@
+FROM rayproject/ray:2.58.0-py311
+
+# Runtime-only image for Ray workers. Application source is uploaded by the
+# Serve driver through runtime_env (see ray_panns/service.py).
+RUN pip install --no-cache-dir \
+    "panns-inference>=0.1.1" \
+    "soundfile>=0.12" \
+    "librosa>=0.10" \
+    "numpy>=1.24"
+
+WORKDIR /app
+ENV PYTHONPATH=/app
+COPY ray_panns ./ray_panns
+COPY main.py run.py rayservice.yaml ./
