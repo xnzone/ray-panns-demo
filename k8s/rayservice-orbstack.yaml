@@ -16,8 +16,13 @@ spec:
         spec:
           containers:
             - name: ray-head
-              image: ray-panns-head:k8s-v1
+              image: ray-panns-head:k8s-v2
               imagePullPolicy: Never
+              env:
+                - name: PANNS_BROKER_URL
+                  value: redis://redis:6379/0
+                - name: PANNS_BACKEND_URL
+                  value: redis://redis:6379/1
               resources:
                 requests:
                   cpu: "1"
@@ -29,7 +34,7 @@ spec:
       - groupName: panns-workers
         replicas: 1
         minReplicas: 1
-        maxReplicas: 2
+        maxReplicas: 4
         rayStartParams:
           num-cpus: "2"
           resources: "'{\"panns_worker\":1}'"
@@ -37,13 +42,17 @@ spec:
           spec:
             containers:
               - name: ray-worker
-                image: ray-panns-worker:k8s-v3
+                image: ray-panns-worker:k8s-v4
                 imagePullPolicy: Never
                 env:
                   - name: PANNS_DEVICE
                     value: cpu
                   - name: PANNS_MOCK
                     value: "1"
+                  - name: PANNS_BROKER_URL
+                    value: redis://redis:6379/0
+                  - name: PANNS_BACKEND_URL
+                    value: redis://redis:6379/1
                 resources:
                   requests:
                     cpu: "1"
@@ -61,9 +70,32 @@ spec:
         route_prefix: /
         import_path: main:app
         deployments:
-          - name: PannsService
+          - name: PannsIngress
             num_replicas: 1
             ray_actor_options:
               num_cpus: 1
+              resources:
+                panns_worker: 0.001
+          - name: PannsConsumer
+            max_ongoing_requests: 1
+            autoscaling_config:
+              min_replicas: 1
+              max_replicas: 4
+              target_ongoing_requests: 1
+              policy:
+                policy_function: "ray.serve.async_inference_autoscaling_policy:AsyncInferenceAutoscalingPolicy"
+                policy_kwargs:
+                  broker_url: "redis://redis:6379/0"
+                  queue_name: "panns-inference"
+            ray_actor_options:
+              num_cpus: 1
+              resources:
+                panns_worker: 0.001
+          - name: PannsEncoder
+            num_replicas: 1
+            max_ongoing_requests: 1
+            ray_actor_options:
+              num_cpus: 1
+              num_gpus: 0
               resources:
                 panns_worker: 0.001

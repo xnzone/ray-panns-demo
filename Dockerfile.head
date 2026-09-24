@@ -1,7 +1,9 @@
 FROM rayproject/ray:2.58.0-py311
 
-# The head needs the Serve application graph so RayService can import main:app.
-# Heavy PANNs runtime dependencies remain in the Worker image.
+# The head imports the producer graph and therefore needs the lightweight
+# queue client. Model dependencies stay in the worker image.
+RUN pip install --no-cache-dir "celery>=5.3" "redis>=5.0"
+
 WORKDIR /app
 ENV PYTHONPATH=/app
 COPY ray_panns ./ray_panns

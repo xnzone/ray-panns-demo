@@ -5,5 +5,18 @@ applications:
     runtime_env:
       working_dir: .
     deployments:
-      - name: PannsService
+      - name: PannsIngress
         num_replicas: 1
+      - name: PannsConsumer
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 4
+          target_ongoing_requests: 1
+          policy:
+            policy_function: "ray.serve.async_inference_autoscaling_policy:AsyncInferenceAutoscalingPolicy"
+            policy_kwargs:
+              broker_url: "redis://127.0.0.1:6379/0"
+              queue_name: "panns-inference"
+      - name: PannsEncoder
+        num_replicas: 1
+        max_ongoing_requests: 1

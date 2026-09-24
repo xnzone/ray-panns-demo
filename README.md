@@ -1,40 +1,126 @@
-# 构建你的第一个 Ray 应用：PANNs 音频标签服务
+# Ray Serve + PANNs：队列驱动的异步推理服务
 
-这是一个最小但完整的 Ray Serve + PANNs 示例：Serve 入口只负责 HTTP 校验和任务转发，Scheduler 负责任务状态与异步 object ref，GPU actor 常驻加载 PANNs Cnn14 模型并串行推理。
+这个项目参考 Ray Serve 的 async inference / video-indexing 设计，已经从“Serve 请求 -> Scheduler -> ObjectRef 轮询”改成了 **Producer + Task Consumer + Model Deployment** 三段式架构：
 
-## 运行
+```text
+HTTP client
+    │ POST /v1/tasks（立即返回 task_id）
+    ▼
+PannsIngress（轻量 Producer）
+    │ enqueue_task_sync
+    ▼
+Redis broker/result backend
+    │ at-least-once、重试、失败队列
+    ▼
+PannsConsumer（@task_consumer，CPU）
+    │ 音频读取/预处理 + encoder handle RPC
+    ▼
+PannsEncoder（标准 Serve Deployment，GPU/CPU）
+    │ 常驻加载 Cnn14
+    ▼
+Redis result backend
+    │ GET /v1/tasks/{task_id}
+    ▼
+HTTP client
+```
+
+## 为什么改成 Consumer Deployment
+
+长推理不再占用 HTTP 连接，也不再需要自定义调度器把 ObjectRef 和任务状态放在内存里：
+
+- `PannsIngress` 只校验参数、投递任务并返回 ID；
+- `PannsConsumer` 使用 `@task_consumer` / `@task_handler` 从消息队列消费任务；
+- Celery adapter 负责结果状态、至少一次投递、自动重试和 dead-letter queue；
+- `PannsEncoder` 是独立的 Serve 模型副本，模型只加载一次；
+- Consumer 对 Encoder 使用 Ray deployment handle，waveform 通过 Ray 对象存储/RPC 传递，不经过第二个 HTTP 服务；
+- Consumer 可以按队列积压做横向扩展，Encoder 可以按 GPU 资源独立扩展。
+
+自定义 `ray_panns/scheduler.py` 已移除；任务生命周期由 Redis/Celery adapter 管理，应用 graph 只包含 Producer、Consumer 和 Encoder。
+
+## 本地运行
+
+需要一个 Redis 作为 broker 和结果后端。最简单的方式：
+
+```bash
+docker run --rm --name ray-panns-redis -p 6379:6379 redis:7-alpine
+```
+
+然后在另一个终端：
 
 ```bash
 pip install -e .
-export PANNS_CHECKPOINT=/models/Cnn14_mAP=0.431.pth
+export PANNS_MOCK=1
+export PANNS_DEVICE=cpu
+export PANNS_BROKER_URL=redis://127.0.0.1:6379/0
+export PANNS_BACKEND_URL=redis://127.0.0.1:6379/1
 serve run main:app
-curl http://127.0.0.1:8000/healthz
+```
+
+提交任务和轮询结果：
+
+```bash
 curl -X POST http://127.0.0.1:8000/v1/tasks \
   -H 'content-type: application/json' \
   -d '{"audio_path":"/data/example.wav","top_k":5}'
+# {"task_id":"...","status":"PENDING", ...}
+
 curl http://127.0.0.1:8000/v1/tasks/<task_id>
+# {"task_id":"...","status":"SUCCESS","result":{...}}
 ```
 
-生产环境应将音频先放入共享存储，并通过白名单路径或对象存储签名 URL 传入；不要让服务进程直接读取任意用户路径。PANNs checkpoint 也应通过镜像或制品仓库注入，而不是提交到 Git。
-
-## 结构
-
-`ray_panns/service.py` 是无状态 Serve 入口；`scheduler.py` 是单写者任务协调器；`workers.py` 以 `num_gpus=1` 声明唯一 GPU 消费者；`panns.py` 将 `panns-inference` 的 Cnn14 推理结果整理为稳定 JSON。模型依赖延迟导入，便于在无 GPU 的机器上做接口测试。
-
-PANNs 的预训练模型来自 AudioSet。默认返回的是 AudioSet 类别索引；如需人类可读标签，可在 `panns.py` 中加载与 checkpoint 匹配的类别表，避免把不匹配的标签文件混用。
-
-在没有 NVIDIA GPU 或 checkpoint 的 OrbStack 本地环境，可用 `PANNS_MOCK=1 PANNS_DEVICE=cpu` 验证 Ray Serve、Scheduler 和任务轮询链路。该模式返回固定的模拟标签，不代表真实 PANNs 推理；部署真实模型时去掉 `PANNS_MOCK` 并挂载 checkpoint。
-
-## OrbStack Kubernetes / KubeRay
-
-单容器 Docker 模式适合快速验证；集群模式使用 `k8s/rayservice-orbstack.yaml`：Head 使用基于官方 Ray 镜像的轻量入口镜像，Worker 使用 `Dockerfile.worker` 构建的业务镜像，KubeRay Operator 通过 `RayService` 管理 Serve 生命周期，不使用 `--working-dir`。业务 Replica 通过 `panns_worker` 自定义资源调度到 Worker，并使用 `proxy_location: EveryNode` 让 HTTP Proxy 只运行在有 Replica 的节点。该本地清单使用 CPU mock 模式；真实 GPU 集群需要替换 Worker 镜像、checkpoint、设备环境变量以及 GPU 资源声明。
-
-首次部署：
+Mock 模式不读取 `audio_path`，只用于验证队列、Consumer、Serve handle 和结果轮询链路。真实推理需要：
 
 ```bash
-docker build -f Dockerfile.head -t ray-panns-head:k8s-v1 .
-docker build -f Dockerfile.worker -t ray-panns-worker:k8s-v3 .
-kubectl apply -f k8s/rayservice-orbstack.yaml
+export PANNS_MOCK=0
+export PANNS_DEVICE=cuda
+export PANNS_CHECKPOINT=/models/Cnn14_mAP=0.431.pth
 ```
 
-发布业务代码时，重新构建业务镜像并更新 RayService；Head 不需要更新。只有 Ray 版本、PANNs 依赖、CUDA 或基础运行时变化时，才需要重新滚动 Worker。
+真实环境不要允许客户端直接提交任意本机路径。应先上传到对象存储/共享文件系统，再传入受控 URI 或白名单路径，并增加文件大小、时长、格式和租户隔离校验。
+
+## 配置
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `PANNS_BROKER_URL` | `redis://127.0.0.1:6379/0` | 任务消息 broker |
+| `PANNS_BACKEND_URL` | 与 broker 相同 | 任务结果 backend |
+| `PANNS_QUEUE_NAME` | `panns-inference` | 主消费队列 |
+| `PANNS_MAX_RETRIES` | `3` | 失败自动重试次数 |
+| `PANNS_FAILED_QUEUE` | `<queue>.failed` | 重试耗尽后的失败队列 |
+| `PANNS_UNPROCESSABLE_QUEUE` | `<queue>.unprocessable` | 无法反序列化/找不到 handler 的队列 |
+| `PANNS_CHECKPOINT` | 无 | Cnn14 checkpoint 路径 |
+| `PANNS_DEVICE` | `cuda` | `cuda` 或 `cpu` |
+| `PANNS_MOCK` | `0` | 本地 mock 开关 |
+
+## Kubernetes / KubeRay
+
+OrbStack 本地示例包含一个开发 Redis：
+
+```bash
+docker build -f Dockerfile.head -t ray-panns-head:k8s-v2 .
+docker build -f Dockerfile.worker -t ray-panns-worker:k8s-v4 .
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/rayservice-orbstack.yaml
+kubectl get rayservice ray-panns
+kubectl port-forward svc/ray-panns-serve-svc 8001:8000
+```
+
+`k8s/rayservice-orbstack.yaml` 当前是 CPU mock 配置。生产 GPU 集群需把 Worker 镜像换成带 CUDA/PANNs 的镜像，设置 `PANNS_DEVICE=cuda`、挂载 checkpoint，并在 `PannsEncoder` 的 Serve 配置中声明 `num_gpus: 1`。Redis 也应替换成带持久化、认证、TLS 和备份的托管服务。
+
+RayService 中的三个 deployment 职责是：
+
+- `PannsIngress`：HTTP producer，1 个副本；
+- `PannsConsumer`：队列消费者，默认 1 个副本，可扩到 4 个副本；
+- `PannsEncoder`：模型副本，默认 1 个副本，单副本最多处理一个推理请求。
+
+## 代码结构
+
+```text
+ray_panns/
+├── config.py    # Celery/Redis TaskProcessorConfig 和 task name
+├── service.py   # PannsIngress：提交任务、查询结果
+├── workers.py   # PannsConsumer + PannsEncoder
+└── panns.py     # CPU 音频读取、PANNs 预处理与模型适配
+```
+
+任务处理函数必须保持同步：只有 handler 返回后，Celery 才会确认消息；这样失败或 Worker 丢失时任务才能安全重投。业务写入外部存储时还要按业务 ID 做幂等，避免 at-least-once 重投造成重复副作用。
